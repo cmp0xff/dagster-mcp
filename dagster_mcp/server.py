@@ -3,6 +3,7 @@
 import bisect
 import json
 import os
+from enum import StrEnum
 from typing import Any, Final, Mapping, Sequence, TypedDict
 
 import httpx
@@ -297,16 +298,79 @@ _METADATA_ENTRIES_FRAGMENT = """
                 ... on PythonArtifactMetadataEntry { module name }
               }"""
 
+class GqlTypename(StrEnum):
+    """Dagster GraphQL union ``__typename`` values compared anywhere in this module.
+
+    Every ``__typename`` field this module reads off the wire is parsed
+    through :func:`_typename` into one of these members, then compared
+    with ``is`` / ``is not``. Values Dagster returns that are not listed
+    here surface as ``None`` from the parser and are treated as unknown.
+    """
+
+    # Event union
+    RUN_FAILURE_EVENT = "RunFailureEvent"
+    EXECUTION_STEP_FAILURE_EVENT = "ExecutionStepFailureEvent"
+    EXECUTION_STEP_UP_FOR_RETRY_EVENT = "ExecutionStepUpForRetryEvent"
+    # Workspace / repository union
+    WORKSPACE = "Workspace"
+    REPOSITORY_LOCATION = "RepositoryLocation"
+    REPOSITORY_CONNECTION = "RepositoryConnection"
+    REPOSITORY_NOT_FOUND_ERROR = "RepositoryNotFoundError"
+    PYTHON_ERROR = "PythonError"
+    # Instigator state + mutation results
+    INSTIGATION_STATE = "InstigationState"
+    SCHEDULE_STATE_RESULT = "ScheduleStateResult"
+    SENSOR = "Sensor"
+    STOP_SENSOR_MUTATION_RESULT = "StopSensorMutationResult"
+    # Asset checks
+    ASSET_CHECKS = "AssetChecks"
+    # Metadata entry variants
+    TEXT_METADATA_ENTRY = "TextMetadataEntry"
+    URL_METADATA_ENTRY = "UrlMetadataEntry"
+    PATH_METADATA_ENTRY = "PathMetadataEntry"
+    JSON_METADATA_ENTRY = "JsonMetadataEntry"
+    MARKDOWN_METADATA_ENTRY = "MarkdownMetadataEntry"
+    FLOAT_METADATA_ENTRY = "FloatMetadataEntry"
+    INT_METADATA_ENTRY = "IntMetadataEntry"
+    BOOL_METADATA_ENTRY = "BoolMetadataEntry"
+    PYTHON_ARTIFACT_METADATA_ENTRY = "PythonArtifactMetadataEntry"
+
+
+class InstigatorType(StrEnum):
+    """User-facing kind used to route between schedules and sensors."""
+
+    SCHEDULE = "SCHEDULE"
+    SENSOR = "SENSOR"
+
+
+def _typename(obj: object) -> GqlTypename | None:
+    """Return the ``__typename`` of ``obj`` as a :class:`GqlTypename` member.
+
+    ``None`` when ``obj`` is not a mapping, has no ``__typename``, or the
+    value is a typename this module does not know about. Callers compare
+    with ``is`` / ``is not`` against enum members.
+    """
+    if not isinstance(obj, Mapping):
+        return None
+    raw = obj.get("__typename")
+    if not isinstance(raw, str):
+        return None
+    try:
+        return GqlTypename(raw)
+    except ValueError:
+        return None
+
+
 # Maps each MetadataEntry __typename to the field holding its value.
-_METADATA_VALUE_FIELDS = {
-    "TextMetadataEntry": "text",
-    "UrlMetadataEntry": "url",
-    "PathMetadataEntry": "path",
-    "JsonMetadataEntry": "jsonString",
-    "MarkdownMetadataEntry": "mdStr",
-    "FloatMetadataEntry": "floatValue",
-    "IntMetadataEntry": "intValue",
-    "BoolMetadataEntry": "boolValue",
+_METADATA_VALUE_FIELDS: dict[GqlTypename, str] = {
+    GqlTypename.TEXT_METADATA_ENTRY: "text",
+    GqlTypename.URL_METADATA_ENTRY: "url",
+    GqlTypename.PATH_METADATA_ENTRY: "path",
+    GqlTypename.JSON_METADATA_ENTRY: "jsonString",
+    GqlTypename.MARKDOWN_METADATA_ENTRY: "mdStr",
+    GqlTypename.FLOAT_METADATA_ENTRY: "floatValue",
+    GqlTypename.INT_METADATA_ENTRY: "intValue",
+    GqlTypename.BOOL_METADATA_ENTRY: "boolValue",
 }
 
 
@@ -331,11 +395,12 @@ def _flatten_metadata(entries: list[dict] | None) -> list[dict]:
     """
     flat = []
     for e in entries or []:
-        typename = e.get("__typename")
-        if typename == "PythonArtifactMetadataEntry":
+        t = _typename(e)
+        if t is GqlTypename.PYTHON_ARTIFACT_METADATA_ENTRY:
             value = f"{e.get('module')}.{e.get('name')}"
         else:
-            value = e.get(_METADATA_VALUE_FIELDS.get(typename, ""))
+            field = _METADATA_VALUE_FIELDS.get(t) if t is not None else None
+            value = e.get(field) if field is not None else None
         flat.append(
             {"label": e.get("label"), "description": e.get("description"), "value": value}
         )
@@ -629,13 +694,18 @@ __METADATA_ENTRIES__
             )
         # Failure events are always surfaced when filtering at ERROR or below:
         # some carry a level that would otherwise exclude them.
-        error_types = ("ExecutionStepFailureEvent", "RunFailureEvent")
+        error_types = frozenset(
+            {
+                GqlTypename.EXECUTION_STEP_FAILURE_EVENT,
+                GqlTypename.RUN_FAILURE_EVENT,
+            }
+        )
         error_rank = _LOG_LEVEL_ORDER["ERROR"]
         result["events"] = [
             e
             for e in result["events"]
             if _LOG_LEVEL_ORDER.get(e.get("level"), -1) >= threshold
-            or (threshold <= error_rank and e.get("__typename") in error_types)
+            or (threshold <= error_rank and _typename(e) in error_types)
         ]
 
     return result
@@ -767,12 +837,15 @@ def get_run_failure_summary(run_id: str, env: str | None = None) -> dict:
             "logsForRun", {}
         )
         events = log_data.get("events", [])
+        failure_event_types = frozenset(
+            {
+                GqlTypename.EXECUTION_STEP_FAILURE_EVENT,
+                GqlTypename.RUN_FAILURE_EVENT,
+                GqlTypename.EXECUTION_STEP_UP_FOR_RETRY_EVENT,
+            }
+        )
         for e in events:
-            if e.get("__typename") in (
-                "ExecutionStepFailureEvent",
-                "RunFailureEvent",
-                "ExecutionStepUpForRetryEvent",
-            ):
+            if _typename(e) in failure_event_types:
                 error_events.append(e)
         if not log_data.get("hasMore"):
             break
@@ -817,7 +890,9 @@ def get_run_failure_summary(run_id: str, env: str | None = None) -> dict:
 
     # 5. Root cause error (run-level failure or first step failure)
     root_cause = None
-    run_failure = [e for e in error_events if e.get("__typename") == "RunFailureEvent"]
+    run_failure = [
+        e for e in error_events if _typename(e) is GqlTypename.RUN_FAILURE_EVENT
+    ]
     if run_failure:
         root_cause = run_failure[0].get("error", {})
     elif failed_steps:
@@ -825,7 +900,11 @@ def get_run_failure_summary(run_id: str, env: str | None = None) -> dict:
 
     # 6. Suggestions
     suggestions: list[str] = []
-    retries = [e for e in error_events if e.get("__typename") == "ExecutionStepUpForRetryEvent"]
+    retries = [
+        e
+        for e in error_events
+        if _typename(e) is GqlTypename.EXECUTION_STEP_UP_FOR_RETRY_EVENT
+    ]
     if retries:
         retry_keys = {e["stepKey"] for e in retries}
         suggestions.append(f"Steps retried before failing: {', '.join(sorted(retry_keys))}")
@@ -1315,16 +1394,16 @@ def _location_unavailable_reason(entry: object) -> tuple[str, str] | None:
         return None
 
     location_or_error = entry.get("locationOrLoadError")
-    typename = (
-        location_or_error.get("__typename")
-        if isinstance(location_or_error, Mapping)
-        else None
-    )
-    if typename == "RepositoryLocation":
+    typename = _typename(location_or_error)
+    if typename is GqlTypename.REPOSITORY_LOCATION:
         return None
 
-    if typename == "PythonError":
-        message = location_or_error.get("message")
+    if typename is GqlTypename.PYTHON_ERROR:
+        message = (
+            location_or_error.get("message")
+            if isinstance(location_or_error, Mapping)
+            else None
+        )
         if not isinstance(message, str) or not message:
             message = "Dagster did not provide an error message"
         return name, message
@@ -1347,8 +1426,9 @@ def _unavailable_code_locations(data: Mapping[str, Any]) -> dict[str, str]:
     turn a working call into a failure.
     """
     workspace = data.get("workspaceOrError")
-    if not isinstance(workspace, Mapping) or workspace.get("__typename") != "Workspace":
+    if _typename(workspace) is not GqlTypename.WORKSPACE:
         return {}
+    assert isinstance(workspace, Mapping)  # narrowed by _typename
 
     entries = workspace.get("locationEntries")
     if not isinstance(entries, list):
@@ -1382,8 +1462,8 @@ def _repository_nodes(
             "expected a union result"
         )
 
-    typename = response.get("__typename")
-    if typename == "RepositoryConnection":
+    typename = _typename(response)
+    if typename is GqlTypename.REPOSITORY_CONNECTION:
         nodes = response.get("nodes")
         if not isinstance(nodes, list) or any(
             not isinstance(node, Mapping) for node in nodes
@@ -1394,19 +1474,20 @@ def _repository_nodes(
             )
         return nodes
 
-    if typename == "RepositoryNotFoundError":
+    if typename is GqlTypename.REPOSITORY_NOT_FOUND_ERROR:
         if not_found_message is not None:
             raise RuntimeError(not_found_message)
         return []
 
-    if typename == "PythonError":
+    if typename is GqlTypename.PYTHON_ERROR:
         message = response.get("message")
         if not isinstance(message, str):
             message = "No error message was provided"
         raise RuntimeError(f"Dagster failed while {context}: {message}")
 
     raise RuntimeError(
-        f"Unexpected Dagster repositoriesOrError typename {typename!r} while {context}"
+        f"Unexpected Dagster repositoriesOrError typename "
+        f"{response.get('__typename')!r} while {context}"
     )
 
 
@@ -1671,12 +1752,13 @@ def list_sensors(env: str | None = None) -> list[dict]:
     return result
 
 
-def _normalize_instigator_type(value: str) -> str:
+def _normalize_instigator_type(value: str) -> InstigatorType:
     """Upper-case and validate an instigator type ('SCHEDULE' or 'SENSOR')."""
     normalized = value.upper()
-    if normalized not in ("SCHEDULE", "SENSOR"):
-        raise ValueError("instigator_type must be 'SCHEDULE' or 'SENSOR'.")
-    return normalized
+    try:
+        return InstigatorType(normalized)
+    except ValueError as exc:
+        raise ValueError("instigator_type must be 'SCHEDULE' or 'SENSOR'.") from exc
 
 
 def _locate_instigators(
@@ -1718,8 +1800,10 @@ def _locate_instigators(
     }
     """ % (state_fields, sensor_state_fields)
     repos = gql(locate, env=env).get("repositoriesOrError", {}).get("nodes", [])
-    field = "schedules" if instigator_type == "SCHEDULE" else "sensors"
-    state_key = "scheduleState" if instigator_type == "SCHEDULE" else "sensorState"
+    field = "schedules" if instigator_type == InstigatorType.SCHEDULE else "sensors"
+    state_key = (
+        "scheduleState" if instigator_type == InstigatorType.SCHEDULE else "sensorState"
+    )
     matches = []
     for repo in repos:
         repo_name = repo["name"]
@@ -1861,7 +1945,7 @@ def get_tick_history(
     state = gql(query, {"selector": selector, "limit": limit}, env=env).get(
         "instigationStateOrError", {}
     )
-    if state.get("__typename") != "InstigationState":
+    if _typename(state) is not GqlTypename.INSTIGATION_STATE:
         return {
             "name": instigator_name,
             "instigator_type": instigator_type,
@@ -1920,7 +2004,7 @@ def start_schedule(
     """
     located, error = _resolve_instigator(
         schedule_name,
-        "SCHEDULE",
+        InstigatorType.SCHEDULE,
         repository_name=repository_name,
         location_name=location_name,
         env=env,
@@ -1943,12 +2027,11 @@ def start_schedule(
     }
     """
     result = gql(query, {"selector": selector}, env=env).get("startSchedule", {})
-    typename = result.get("__typename")
-    if typename == "ScheduleStateResult":
+    if _typename(result) is GqlTypename.SCHEDULE_STATE_RESULT:
         state = result.get("scheduleState") or {}
         return {
             "name": schedule_name,
-            "instigator_type": "SCHEDULE",
+            "instigator_type": InstigatorType.SCHEDULE,
             "repository": located["repositoryName"],
             "location": located["repositoryLocationName"],
             "status": state.get("status"),
@@ -1956,10 +2039,12 @@ def start_schedule(
         }
     return {
         "name": schedule_name,
-        "instigator_type": "SCHEDULE",
+        "instigator_type": InstigatorType.SCHEDULE,
         "repository": located["repositoryName"],
         "location": located["repositoryLocationName"],
-        "message": result.get("message", f"Unknown error ({typename})."),
+        "message": result.get(
+            "message", f"Unknown error ({result.get('__typename')})."
+        ),
     }
 
 
@@ -1992,7 +2077,7 @@ def stop_schedule(
     """
     located, error = _resolve_instigator(
         schedule_name,
-        "SCHEDULE",
+        InstigatorType.SCHEDULE,
         repository_name=repository_name,
         location_name=location_name,
         env=env,
@@ -2004,7 +2089,7 @@ def stop_schedule(
     if not state.get("id") or not state.get("selectorId"):
         return {
             "name": schedule_name,
-            "instigator_type": "SCHEDULE",
+            "instigator_type": InstigatorType.SCHEDULE,
             "repository": located["repositoryName"],
             "location": located["repositoryLocationName"],
             "message": _missing_state_ids_message("schedule", schedule_name),
@@ -2021,12 +2106,11 @@ def stop_schedule(
     """
     variables = {"originId": state["id"], "selectorId": state["selectorId"]}
     result = gql(query, variables, env=env).get("stopRunningSchedule", {})
-    typename = result.get("__typename")
-    if typename == "ScheduleStateResult":
+    if _typename(result) is GqlTypename.SCHEDULE_STATE_RESULT:
         new_state = result.get("scheduleState") or {}
         return {
             "name": schedule_name,
-            "instigator_type": "SCHEDULE",
+            "instigator_type": InstigatorType.SCHEDULE,
             "repository": located["repositoryName"],
             "location": located["repositoryLocationName"],
             "status": new_state.get("status"),
@@ -2034,10 +2118,12 @@ def stop_schedule(
         }
     return {
         "name": schedule_name,
-        "instigator_type": "SCHEDULE",
+        "instigator_type": InstigatorType.SCHEDULE,
         "repository": located["repositoryName"],
         "location": located["repositoryLocationName"],
-        "message": result.get("message", f"Unknown error ({typename})."),
+        "message": result.get(
+            "message", f"Unknown error ({result.get('__typename')})."
+        ),
     }
 
 
@@ -2067,7 +2153,7 @@ def start_sensor(
     """
     located, error = _resolve_instigator(
         sensor_name,
-        "SENSOR",
+        InstigatorType.SENSOR,
         repository_name=repository_name,
         location_name=location_name,
         env=env,
@@ -2090,12 +2176,11 @@ def start_sensor(
     }
     """
     result = gql(query, {"selector": selector}, env=env).get("startSensor", {})
-    typename = result.get("__typename")
-    if typename == "Sensor":
+    if _typename(result) is GqlTypename.SENSOR:
         state = result.get("sensorState") or {}
         return {
             "name": sensor_name,
-            "instigator_type": "SENSOR",
+            "instigator_type": InstigatorType.SENSOR,
             "repository": located["repositoryName"],
             "location": located["repositoryLocationName"],
             "status": state.get("status"),
@@ -2103,10 +2188,12 @@ def start_sensor(
         }
     return {
         "name": sensor_name,
-        "instigator_type": "SENSOR",
+        "instigator_type": InstigatorType.SENSOR,
         "repository": located["repositoryName"],
         "location": located["repositoryLocationName"],
-        "message": result.get("message", f"Unknown error ({typename})."),
+        "message": result.get(
+            "message", f"Unknown error ({result.get('__typename')})."
+        ),
     }
 
 
@@ -2138,7 +2225,7 @@ def stop_sensor(
     """
     located, error = _resolve_instigator(
         sensor_name,
-        "SENSOR",
+        InstigatorType.SENSOR,
         repository_name=repository_name,
         location_name=location_name,
         env=env,
@@ -2150,7 +2237,7 @@ def stop_sensor(
     if not state.get("id") or not state.get("selectorId"):
         return {
             "name": sensor_name,
-            "instigator_type": "SENSOR",
+            "instigator_type": InstigatorType.SENSOR,
             "repository": located["repositoryName"],
             "location": located["repositoryLocationName"],
             "message": _missing_state_ids_message("sensor", sensor_name),
@@ -2167,12 +2254,11 @@ def stop_sensor(
     """
     variables = {"originId": state["id"], "selectorId": state["selectorId"]}
     result = gql(query, variables, env=env).get("stopSensor", {})
-    typename = result.get("__typename")
-    if typename == "StopSensorMutationResult":
+    if _typename(result) is GqlTypename.STOP_SENSOR_MUTATION_RESULT:
         new_state = result.get("instigationState") or {}
         return {
             "name": sensor_name,
-            "instigator_type": "SENSOR",
+            "instigator_type": InstigatorType.SENSOR,
             "repository": located["repositoryName"],
             "location": located["repositoryLocationName"],
             "status": new_state.get("status"),
@@ -2180,10 +2266,12 @@ def stop_sensor(
         }
     return {
         "name": sensor_name,
-        "instigator_type": "SENSOR",
+        "instigator_type": InstigatorType.SENSOR,
         "repository": located["repositoryName"],
         "location": located["repositoryLocationName"],
-        "message": result.get("message", f"Unknown error ({typename})."),
+        "message": result.get(
+            "message", f"Unknown error ({result.get('__typename')})."
+        ),
     }
 
 
@@ -2641,7 +2729,7 @@ def materialize_assets(
     seen_checks: set[tuple[str, str]] = set()
     for key in launched_keys:
         checks_or_error = nodes_by_key[key].get("assetChecksOrError") or {}
-        if checks_or_error.get("__typename") != "AssetChecks":
+        if _typename(checks_or_error) is not GqlTypename.ASSET_CHECKS:
             continue
         for check in checks_or_error.get("checks", []):
             check_jobs = check.get("jobNames") or []
